@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-splits",
+  "version": "0.1.0",
+  "description": "Split-pane workspace for OpenCode: multiple sessions, terminals, and a quake-style drop-down terminal",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./tui": "./src/tui.tsx"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tui",
+    "splits",
+    "tmux",
+    "terminal"
+  ],
+  "engines": {
+    "opencode": ">=2.2.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@opencode/client": "^2.2.5",
+    "@opencode/plugin": "^2.2.5"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.6.6",
+    "@opentui/solid": ">=0.6.6",
+    "solid-js": ">=1.9.0"
+  },
+  "devDependencies": {
+    "@opentui/core": "^0.8.1",
+    "@opentui/solid": "^0.8.1",
+    "@types/node": "^24.0.0",
+    "solid-js": "^1.9.18",
+    "typescript": "^5.9.0"
+  }
+}
