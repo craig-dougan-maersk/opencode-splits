@@ -45,6 +45,7 @@ export default Plugin.define({
     })
 
     const inWorkspace = () => controller.isWorkspace()
+    const focusedTerminal = () => inWorkspace() && controller.focusedPane()?.kind === "terminal"
 
     context.keymap.layer(() => ({
       mode: "global",
@@ -189,12 +190,79 @@ export default Plugin.define({
           run: () => void controller.newSession(),
         },
         {
-          id: "splits.new.terminal",
-          title: "New terminal in split",
+          id: "splits.terminal.new",
+          title: "New terminal with profile and context",
+          description: "Choose the environment profile, Kubernetes context and SSH key, then open the terminal",
           group: "Splits",
           bind: "ctrl+alt+t",
+          palette: true,
           enabled: inWorkspace,
-          run: () => controller.newTerminal(),
+          run: () => void controller.newTerminalWizard(),
+        },
+        {
+          id: "splits.shell",
+          title: "Shell",
+          description: "Open a terminal beside the session, choosing profile, Kubernetes context and SSH key",
+          group: "Splits",
+          palette: true,
+          slash: { name: "shell", aliases: ["term", "terminal"] },
+          run: () => void controller.newTerminalWizard(),
+        },
+        {
+          id: "splits.tab.next",
+          title: "Next terminal tab",
+          group: "Splits",
+          bind: "ctrl+alt+f",
+          enabled: focusedTerminal,
+          run: () => controller.nextTab(controller.state.focused, 1),
+        },
+        {
+          id: "splits.tab.prev",
+          title: "Previous terminal tab",
+          group: "Splits",
+          bind: "ctrl+alt+b",
+          enabled: focusedTerminal,
+          run: () => controller.nextTab(controller.state.focused, -1),
+        },
+        {
+          id: "splits.tab.new",
+          title: "New terminal tab",
+          group: "Splits",
+          bind: "ctrl+alt+shift+t",
+          enabled: focusedTerminal,
+          run: () => void controller.newTerminalTab(),
+        },
+        {
+          id: "splits.tab.close",
+          title: "Close terminal tab",
+          group: "Splits",
+          bind: "ctrl+alt+shift+x",
+          enabled: focusedTerminal,
+          run: () => controller.closeTerminalTab(controller.state.focused),
+        },
+        {
+          id: "splits.pane.minimise",
+          title: "Minimise or restore focused pane",
+          group: "Splits",
+          bind: "ctrl+alt+m",
+          enabled: inWorkspace,
+          run: () => controller.toggleMinimiseFocused(),
+        },
+        {
+          id: "splits.pane.move.prev",
+          title: "Move pane earlier",
+          group: "Splits",
+          bind: "ctrl+alt+shift+p",
+          enabled: inWorkspace,
+          run: () => controller.moveFocused(-1),
+        },
+        {
+          id: "splits.pane.move.next",
+          title: "Move pane later",
+          group: "Splits",
+          bind: "ctrl+alt+shift+l",
+          enabled: inWorkspace,
+          run: () => controller.moveFocused(1),
         },
         {
           id: "splits.open.session",

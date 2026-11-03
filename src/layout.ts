@@ -1,4 +1,4 @@
-import type { LayoutNode, SplitDirection, WorkspaceState } from "./types.ts"
+import type { LayoutNode, PaneState, SplitDirection, WorkspaceState } from "./types.ts"
 
 export function clampRatio(value: number): number {
   if (!Number.isFinite(value)) return 0.5
@@ -154,9 +154,42 @@ export function validateTree(node: LayoutNode | null | undefined): string[] {
   return errors
 }
 
+/** Exchange the positions of two panes in the tree. */
+export function swapLeaf(node: LayoutNode, a: string, b: string): LayoutNode {
+  if (node.type === "leaf") {
+    if (node.paneID === a) return { ...node, paneID: b }
+    if (node.paneID === b) return { ...node, paneID: a }
+    return node
+  }
+  return { ...node, a: swapLeaf(node.a, a, b), b: swapLeaf(node.b, a, b) }
+}
+
+/**
+ * Render-only projection of the tree with minimised panes removed. The stored
+ * tree is left intact, so restoring a pane is just clearing its flag.
+ */
+export function pruneMinimised(
+  node: LayoutNode | null | undefined,
+  panes: Record<string, PaneState>,
+): LayoutNode | null {
+  if (!node) return null
+  if (node.type === "leaf") return panes[node.paneID]?.minimised ? null : node
+  const a = pruneMinimised(node.a, panes)
+  const b = pruneMinimised(node.b, panes)
+  if (!a && !b) return null
+  if (!a) return b
+  if (!b) return a
+  return { ...node, a, b }
+}
+
+/** Pane ids that are present in the tree but hidden by the minimise flag. */
+export function minimisedLeafIDs(node: LayoutNode, panes: Record<string, PaneState>): string[] {
+  return leafIDs(node).filter((id) => panes[id]?.minimised)
+}
+
 /** Repair a persisted state so it can always be rendered. */
 export function normalizeState(state: WorkspaceState, fallbackPaneID: string): WorkspaceState {
-  const panes = { ...state.panes }
+  const panes: Record<string, PaneState> = { ...state.panes }
   const root = state.root ?? { type: "leaf", paneID: fallbackPaneID } as LayoutNode
   const ids = leafIDs(root)
   if (ids.length === 0) {
@@ -172,6 +205,34 @@ export function normalizeState(state: WorkspaceState, fallbackPaneID: string): W
   for (const id of Object.keys(panes)) {
     if (!ids.includes(id)) delete panes[id]
   }
-  const focused = ids.includes(state.focused) ? state.focused : ids[0]!
+  for (const id of ids) normalizePane(panes[id]!)
+  const focused = pickFocus(ids, panes, state.focused)
   return { ...state, root, panes, focused }
+}
+
+/**
+ * A terminal pane always has at least one tab. Legacy workspaces stored a
+ * single terminal on the pane itself; migrate those into a tab in place.
+ */
+function normalizePane(pane: PaneState): void {
+  if (pane.kind !== "terminal") return
+  if (!Array.isArray(pane.tabs) || pane.tabs.length === 0) {
+    pane.tabs = [{ id: `${pane.id}-1`, ptyID: pane.ptyID, title: pane.title }]
+  }
+  for (const [index, tab] of pane.tabs.entries()) {
+    if (!tab.id) tab.id = `${pane.id}-${index + 1}`
+  }
+  const active = Number.isInteger(pane.activeTab) ? (pane.activeTab as number) : 0
+  pane.activeTab = Math.min(Math.max(0, active), pane.tabs.length - 1)
+}
+
+/** Keep focus on a pane that is actually visible. */
+function pickFocus(
+  ids: string[],
+  panes: Record<string, PaneState>,
+  focused: string,
+): string {
+  const visible = ids.filter((id) => !panes[id]?.minimised)
+  const pool = visible.length ? visible : ids
+  return pool.includes(focused) ? focused : pool[0]!
 }
