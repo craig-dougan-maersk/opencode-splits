@@ -1,4 +1,6 @@
 import { createEffect, createSignal, type Accessor } from "solid-js"
+import os from "node:os"
+import path from "node:path"
 import type { OpenCodeClient } from "@opencode/client"
 import {
   adjustRatio,
@@ -7,12 +9,16 @@ import {
   equalize,
   leafIDs,
   normalizeState,
+  pruneMinimised,
   removeLeaf,
   splitLeaf,
+  swapLeaf,
 } from "./layout.ts"
-import type { LayoutNode, PaneKind, PaneState, SplitDirection, WorkspaceState } from "./types.ts"
+import type { KubeSelection, LayoutNode, PaneKind, PaneState, SplitDirection, TerminalTab, WorkspaceState } from "./types.ts"
+import { processEnv, type SplitsOptions } from "./config.ts"
+import { buildTerminalEnv, createManagers, selectorYaml, writePrivateFile, type EnvState, type K8sState, type LocationRef, type Managers, type SshState } from "./integrations.ts"
+import { launchWizard, type TerminalSelection } from "./launch.ts"
 import { removePersistentPty } from "./pty.ts"
-import type { SplitsOptions } from "./config.ts"
 
 export interface OverlayState {
   open: boolean
@@ -25,9 +31,32 @@ export interface FocusHandle {
   blur(): void
 }
 
+export interface TabSelection {
+  profile?: string
+  kube?: KubeSelection
+  sshKey?: string
+}
+
+export interface Catalogue {
+  loaded: boolean
+  sessionID?: string
+  env?: EnvState
+  k8s?: K8sState
+  ssh?: SshState
+}
+
+export interface TerminalEnvResult {
+  env: Record<string, string>
+  context?: string
+  profile?: string
+  sshSocket?: string
+  warnings: string[]
+}
+
 export interface WorkspaceController {
   readonly context: any
   readonly client: OpenCodeClient
+  readonly managers: Managers
   readonly options: SplitsOptions
   readonly state: WorkspaceState
   readonly zoom: Accessor<boolean>
@@ -36,7 +65,7 @@ export interface WorkspaceController {
   focusedPane(): PaneState | undefined
   focusedSession(): string | undefined
   setFocused(paneID: string): void
-  split(kind: PaneKind, direction: SplitDirection, sessionID?: string, directory?: string): string
+  split(kind: PaneKind, direction: SplitDirection, sessionID?: string, directory?: string, selection?: TerminalSelection): string
   closeFocused(): void
   cycle(step: number): void
   resize(direction: "left" | "right" | "up" | "down", delta?: number): void
@@ -46,15 +75,44 @@ export interface WorkspaceController {
   back(): void
   ensureSession(paneID: string, preferred?: string): Promise<string | undefined>
   newSession(directory?: string): Promise<void>
-  newTerminal(sessionID?: string): void
+  newTerminalWizard(sessionID?: string): Promise<void>
+  newTerminalTab(paneID?: string): Promise<void>
   pickSession(): Promise<void>
   toggleOverlay(): void
   closeOverlay(): void
   setOverlayPty(ptyID: string | undefined): void
   trackPty(ptyID: string): void
   forgetPty(ptyID: string): void
-  setPanePty(paneID: string, ptyID: string | undefined): void
-  setPaneTitle(paneID: string, title: string): void
+
+  // terminal tabs
+  terminalTabs(paneID: string): TerminalTab[]
+  activeTab(paneID: string): TerminalTab | undefined
+  setActiveTab(paneID: string, index: number): void
+  nextTab(paneID: string, step: number): void
+  addTerminalTab(paneID: string, selection?: TerminalSelection): string
+  ensureTerminalTab(paneID: string): string
+  closeTerminalTab(paneID: string, tabId?: string): void
+  setTabPty(paneID: string, tabId: string, ptyID: string | undefined): void
+  setTabTitle(paneID: string, tabId: string, title: string): void
+  setTabSelection(paneID: string, tabId: string, selection: TabSelection): void
+  buildEnvForTab(paneID: string, tabId: string): Promise<TerminalEnvResult>
+  buildEnvForSession(sessionID?: string, directory?: string): Promise<TerminalEnvResult>
+
+  // environment catalogue and locations
+  catalogue(): Catalogue
+  refreshCatalogue(sessionID?: string): Promise<void>
+  sessionDirectoryFor(sessionID?: string): string
+  locationFor(sessionID?: string): LocationRef
+
+  // pty restart
+  registerRestarter(id: string, fn: () => void): () => void
+  restart(id: string): void
+
+  // layout
+  toggleMinimiseFocused(): void
+  restorePane(paneID: string): void
+  moveFocused(step: number): void
+
   registerFocusable(id: string, handle: FocusHandle): () => void
   requestFocus(id: string): void
   cleanup(): Promise<void>
@@ -73,16 +131,32 @@ function sessionDirectory(context: any): string {
   return context.location?.directory ?? context.data.location.default()?.directory ?? process.cwd()
 }
 
+function safeName(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]+/g, "_") || "selector"
+}
+
+function newTabID(): string {
+  try {
+    return `t-${globalThis.crypto?.randomUUID?.().slice(0, 8) ?? Math.random().toString(36).slice(2, 10)}`
+  } catch {
+    return `t-${Math.random().toString(36).slice(2, 10)}`
+  }
+}
+
 export function createWorkspace(context: any, options: SplitsOptions): WorkspaceController {
   const client = context.client as OpenCodeClient
+  const managers = createManagers(client, (message) => console.error(`[splits] ${message}`))
+  const selectorDir = path.join(os.homedir(), ".local", "state", "opencode", "splits", "k8s")
   const [state, update] = (context.storage.store as any)("workspace", {
     initial: normalizeState(initialState(), "p1"),
   })
   const [zoom, setZoom] = createSignal(false)
   const [overlay, setOverlay] = createSignal<OverlayState>({ open: false })
+  const [catalogue, setCatalogue] = createSignal<Catalogue>({ loaded: false })
   const ptys = new Set<string>()
   const creating = new Map<string, Promise<string | undefined>>()
   const focusables = new Map<string, FocusHandle>()
+  const restarters = new Map<string, () => void>()
   let activeFocus: string | undefined
 
   const mutate = (fn: (draft: WorkspaceState) => void) => {
@@ -126,6 +200,17 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
     }
   }
 
+  const registerRestarter = (id: string, fn: () => void) => {
+    restarters.set(id, fn)
+    return () => {
+      if (restarters.get(id) === fn) restarters.delete(id)
+    }
+  }
+
+  const restart = (id: string) => {
+    restarters.get(id)?.()
+  }
+
   createEffect(() => {
     const target = targetFocus()
     if (target === activeFocus) return
@@ -156,6 +241,15 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
   const focusedPane = (): PaneState | undefined => state.panes[state.focused]
   const focusedSession = (): string | undefined => focusedPane()?.sessionID
 
+  const routeSession = (): string | undefined => {
+    try {
+      const route = context.ui.router.current()
+      return route?.type === "session" ? route.sessionID : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   const setFocused = (paneID: string) => {
     if (!state.panes[paneID]) return
     mutate((draft) => {
@@ -173,10 +267,23 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
     direction: SplitDirection,
     sessionID?: string,
     directory?: string,
+    selection?: TerminalSelection,
   ): string => {
     const target = state.focused
     const { id, counter } = newPaneID()
     const pane: PaneState = { id, kind, sessionID, directory }
+    if (kind === "terminal") {
+      pane.tabs = [
+        {
+          id: newTabID(),
+          title: selection?.title,
+          profile: selection?.profile,
+          kube: selection?.kube,
+          sshKey: selection?.sshKey,
+        },
+      ]
+      pane.activeTab = 0
+    }
     const splitID = `s${counter}`
     mutate((draft) => {
       draft.counter = counter
@@ -187,23 +294,35 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
     return id
   }
 
-  const closeFocused = () => {
-    const target = state.focused
+  const panePtys = (pane: PaneState | undefined): string[] => {
+    if (!pane) return []
+    if (pane.kind === "terminal") {
+      return (pane.tabs ?? []).map((tab) => tab.ptyID).filter((value): value is string => Boolean(value))
+    }
+    return pane.ptyID ? [pane.ptyID] : []
+  }
+
+  const closePane = (paneID: string): boolean => {
     if (leafIDs(state.root).length <= 1) {
       context.ui.toast.show({ message: "Splits: keep at least one pane", variant: "warning" })
-      return
+      return false
     }
-    const pane = state.panes[target]
-    if (pane?.kind === "terminal" && pane.ptyID) {
-      void removePersistentPty(client, pane.ptyID)
-      ptys.delete(pane.ptyID)
+    const pane = state.panes[paneID]
+    for (const ptyID of panePtys(pane)) {
+      void removePersistentPty(client, ptyID)
+      ptys.delete(ptyID)
     }
     mutate((draft) => {
-      const root = removeLeaf(draft.root, target)
+      const root = removeLeaf(draft.root, paneID)
       if (!root) return
       draft.root = root
-      delete draft.panes[target]
+      delete draft.panes[paneID]
     })
+    return true
+  }
+
+  const closeFocused = () => {
+    closePane(state.focused)
   }
 
   const cycle = (step: number) => {
@@ -224,6 +343,211 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
   }
 
   const toggleZoom = () => setZoom((value) => !value)
+
+  const toggleMinimiseFocused = () => {
+    const id = state.focused
+    const pane = state.panes[id]
+    if (!pane) return
+    const next = !pane.minimised
+    mutate((draft) => {
+      const target = draft.panes[id]
+      if (target) target.minimised = next
+    })
+  }
+
+  const restorePane = (paneID: string) => {
+    mutate((draft) => {
+      const target = draft.panes[paneID]
+      if (target) target.minimised = false
+    })
+    setFocused(paneID)
+  }
+
+  const moveFocused = (step: number) => {
+    const ids = leafIDs(state.root)
+    const current = state.focused
+    const index = ids.indexOf(current)
+    if (index < 0) return
+    const target = ids[(index + step + ids.length) % ids.length]
+    if (!target || target === current) return
+    mutate((draft) => {
+      draft.root = swapLeaf(draft.root, current, target)
+      draft.focused = current
+    })
+  }
+
+  // ---- terminal tabs -------------------------------------------------------
+
+  const paneOf = (paneID: string): PaneState | undefined =>
+    (state.panes as Record<string, PaneState>)[paneID]
+
+  const tabsOf = (paneID: string): TerminalTab[] => paneOf(paneID)?.tabs ?? []
+
+  const terminalTabs = (paneID: string): TerminalTab[] => tabsOf(paneID)
+
+  const activeTab = (paneID: string): TerminalTab | undefined => {
+    const pane = paneOf(paneID)
+    if (pane?.kind !== "terminal" || !pane.tabs?.length) return undefined
+    const index = pane.activeTab ?? 0
+    return pane.tabs[index] ?? pane.tabs[0]
+  }
+
+  const setActiveTab = (paneID: string, index: number) => {
+    mutate((draft) => {
+      const pane = draft.panes[paneID]
+      if (pane?.tabs?.length) pane.activeTab = Math.min(Math.max(0, index), pane.tabs.length - 1)
+    })
+  }
+
+  const nextTab = (paneID: string, step: number) => {
+    const pane = paneOf(paneID)
+    if (!pane?.tabs?.length) return
+    const count = pane.tabs.length
+    setActiveTab(paneID, ((pane.activeTab ?? 0) + step + count) % count)
+  }
+
+  const addTerminalTab = (paneID: string, selection?: TerminalSelection): string => {
+    const tabId = newTabID()
+    mutate((draft) => {
+      const pane = draft.panes[paneID]
+      if (!pane || pane.kind !== "terminal") return
+      pane.tabs = [
+        ...(pane.tabs ?? []),
+        {
+          id: tabId,
+          title: selection?.title,
+          profile: selection?.profile,
+          kube: selection?.kube,
+          sshKey: selection?.sshKey,
+        },
+      ]
+      pane.activeTab = pane.tabs.length - 1
+      pane.minimised = false
+    })
+    return tabId
+  }
+
+  const ensureTerminalTab = (paneID: string): string => {
+    const pane = paneOf(paneID)
+    if (pane?.kind === "terminal" && pane.tabs?.length) {
+      return pane.tabs[pane.activeTab ?? 0]?.id ?? pane.tabs[0]!.id
+    }
+    return addTerminalTab(paneID)
+  }
+
+  const closeTerminalTab = (paneID: string, tabId?: string) => {
+    const pane = paneOf(paneID)
+    if (pane?.kind !== "terminal" || !pane.tabs?.length) return
+    const index = tabId ? pane.tabs.findIndex((tab) => tab.id === tabId) : pane.activeTab ?? 0
+    const tab = pane.tabs[index]
+    if (!tab) return
+    if (tab.ptyID) {
+      void removePersistentPty(client, tab.ptyID)
+      ptys.delete(tab.ptyID)
+    }
+    if (pane.tabs.length <= 1) {
+      closePane(paneID)
+      return
+    }
+    mutate((draft) => {
+      const target = draft.panes[paneID]
+      if (!target?.tabs) return
+      target.tabs = target.tabs.filter((entry) => entry.id !== tab.id)
+      target.activeTab = Math.min(index, target.tabs.length - 1)
+    })
+  }
+
+  const setTabPty = (paneID: string, tabId: string, ptyID: string | undefined) => {
+    mutate((draft) => {
+      const tab = draft.panes[paneID]?.tabs?.find((entry) => entry.id === tabId)
+      if (tab) tab.ptyID = ptyID
+    })
+  }
+
+  const setTabTitle = (paneID: string, tabId: string, title: string) => {
+    mutate((draft) => {
+      const tab = draft.panes[paneID]?.tabs?.find((entry) => entry.id === tabId)
+      if (tab && tab.title !== title) tab.title = title
+    })
+  }
+
+  const setTabSelection = (paneID: string, tabId: string, selection: TabSelection) => {
+    mutate((draft) => {
+      const tab = draft.panes[paneID]?.tabs?.find((entry) => entry.id === tabId)
+      if (!tab) return
+      if ("profile" in selection) tab.profile = selection.profile
+      if ("kube" in selection) tab.kube = selection.kube
+      if ("sshKey" in selection) tab.sshKey = selection.sshKey
+    })
+  }
+
+  const locationFor = (sessionID?: string): LocationRef => {
+    const info = sessionID ? context.data.session.get(sessionID) : undefined
+    return info?.location ?? context.location ?? context.data.location.default()
+  }
+
+  const sessionDirectoryFor = (sessionID?: string): string => {
+    const info = sessionID ? context.data.session.get(sessionID) : undefined
+    return info?.location?.directory ?? context.location?.directory ?? process.cwd()
+  }
+
+  /**
+   * Compose the environment for a terminal. Precedence is fixed in
+   * buildTerminalEnv: base -> env-manager profile -> KUBECONFIG -> SSH agent.
+   */
+  const composeEnv = async (input: {
+    sessionID?: string
+    directory?: string
+    profile?: string
+    kube?: KubeSelection
+    sshKey?: string
+    selectorName: string
+  }) => {
+    const result = await buildTerminalEnv({
+      managers,
+      base: processEnv(options.env),
+      sessionID: input.sessionID,
+      directory: input.directory ?? sessionDirectoryFor(input.sessionID),
+      location: locationFor(input.sessionID),
+      profile: input.profile,
+      kube: input.kube,
+      sshKey: input.sshKey,
+      selectorFile: async (selected) => {
+        const file = path.join(selectorDir, `${safeName(input.selectorName)}.yaml`)
+        await writePrivateFile(file, selectorYaml(selected))
+        return file
+      },
+    })
+    return { env: result.env, context: result.context, profile: result.profile, sshSocket: result.sshSocket, warnings: result.warnings }
+  }
+
+  const buildEnvForTab = (paneID: string, tabId: string) => {
+    const pane = paneOf(paneID)
+    const tab = pane?.tabs?.find((entry) => entry.id === tabId)
+    return composeEnv({
+      sessionID: pane?.sessionID,
+      directory: pane?.directory,
+      profile: tab?.profile,
+      kube: tab?.kube,
+      sshKey: tab?.sshKey,
+      selectorName: `${paneID}-${tabId}`,
+    })
+  }
+
+  /** Environment for a terminal that follows the session's own selection. */
+  const buildEnvForSession = (sessionID?: string, directory?: string) =>
+    composeEnv({ sessionID, directory, selectorName: `session-${sessionID ?? "default"}` })
+
+  const refreshCatalogue = async (sessionID?: string) => {
+    const target = sessionID ?? focusedSession() ?? routeSession()
+    const location = locationFor(target)
+    const [env, k8s, ssh] = await Promise.all([
+      managers.envState({ sessionID: target, baseEnv: processEnv(options.env) }, location),
+      managers.k8sState({ sessionID: target }, location),
+      managers.sshState({ sessionID: target, directory: sessionDirectoryFor(target) }, location),
+    ])
+    setCatalogue({ loaded: true, sessionID: target, env, k8s, ssh })
+  }
 
   const openWorkspace = (data?: { sessionID?: string }) => {
     const route = context.ui.router.current()
@@ -314,9 +638,64 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
     }
   }
 
-  const newTerminal = (sessionID?: string) => {
+  /** Add a terminal, reusing the focused terminal pane as a new tab when possible. */
+  const openTerminal = (sessionID?: string, selection?: TerminalSelection): string => {
     const targetSession = sessionID ?? focusedSession()
-    split("terminal", "column", targetSession)
+    const focused = focusedPane()
+    if (focused?.kind === "terminal") {
+      addTerminalTab(focused.id, selection)
+      return focused.id
+    }
+    return split("terminal", "column", targetSession, sessionDirectoryFor(targetSession), selection)
+  }
+
+  const newTerminalWizard = async (sessionID?: string) => {
+    const targetSession = sessionID ?? focusedSession() ?? routeSession()
+    if (!targetSession) {
+      context.ui.toast.show({
+        message: "Splits: open a session before adding a terminal",
+        variant: "info",
+      })
+      return
+    }
+    const selection = await launchWizard(context, managers, {
+      sessionID: targetSession,
+      directory: sessionDirectoryFor(targetSession),
+      location: locationFor(targetSession),
+    })
+    if (!selection) return
+    if (!isWorkspace()) openWorkspace({ sessionID: targetSession })
+    openTerminal(targetSession, selection)
+    void refreshCatalogue(targetSession)
+  }
+
+  /**
+   * Add a tab to a terminal pane (or create a terminal pane when the focused
+   * pane is a session), choosing the environment through the wizard.
+   */
+  const newTerminalTab = async (paneID?: string) => {
+    const target = paneID ?? focusedPane()?.id
+    const pane = target ? paneOf(target) : undefined
+    if (!pane || pane.kind !== "terminal") {
+      await newTerminalWizard(pane?.sessionID)
+      return
+    }
+    const sessionID = pane.sessionID ?? focusedSession() ?? routeSession()
+    if (!sessionID) {
+      context.ui.toast.show({
+        message: "Splits: the terminal pane has no session to inherit from",
+        variant: "info",
+      })
+      return
+    }
+    const selection = await launchWizard(context, managers, {
+      sessionID,
+      directory: pane.directory ?? sessionDirectoryFor(sessionID),
+      location: locationFor(sessionID),
+    })
+    if (!selection) return
+    addTerminalTab(pane.id, selection)
+    void refreshCatalogue(sessionID)
   }
 
   const pickSession = async () => {
@@ -344,9 +723,7 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
       closeOverlay()
       return
     }
-    const sessionID = focusedSession() ?? (context.ui.router.current()?.type === "session"
-      ? context.ui.router.current().sessionID
-      : undefined)
+    const sessionID = focusedSession() ?? routeSession()
     if (!sessionID) {
       context.ui.toast.show({ message: "Splits: focus a session pane first", variant: "info" })
       return
@@ -365,20 +742,6 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
     ptys.delete(ptyID)
   }
 
-  const setPanePty = (paneID: string, ptyID: string | undefined) => {
-    mutate((draft) => {
-      const pane = draft.panes[paneID]
-      if (pane) pane.ptyID = ptyID
-    })
-  }
-
-  const setPaneTitle = (paneID: string, title: string) => {
-    mutate((draft) => {
-      const pane = draft.panes[paneID]
-      if (pane) pane.title = title
-    })
-  }
-
   const cleanup = async () => {
     for (const ptyID of ptys) {
       await removePersistentPty(client, ptyID)
@@ -389,6 +752,7 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
   return {
     context,
     client,
+    managers,
     options,
     state,
     zoom,
@@ -407,15 +771,35 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
     back,
     ensureSession,
     newSession,
-    newTerminal,
+    newTerminalWizard,
+    newTerminalTab,
     pickSession,
     toggleOverlay,
     closeOverlay,
     setOverlayPty,
     trackPty,
     forgetPty,
-    setPanePty,
-    setPaneTitle,
+    terminalTabs,
+    activeTab,
+    setActiveTab,
+    nextTab,
+    addTerminalTab,
+    ensureTerminalTab,
+    closeTerminalTab,
+    setTabPty,
+    setTabTitle,
+    setTabSelection,
+    buildEnvForTab,
+    buildEnvForSession,
+    catalogue,
+    refreshCatalogue,
+    sessionDirectoryFor,
+    locationFor,
+    registerRestarter,
+    restart,
+    toggleMinimiseFocused,
+    restorePane,
+    moveFocused,
     registerFocusable,
     requestFocus,
     cleanup,
@@ -426,5 +810,7 @@ export function createWorkspace(context: any, options: SplitsOptions): Workspace
 export function nextRatio(current: number, delta: number): number {
   return clampRatio(current + delta)
 }
+
+export { pruneMinimised }
 
 export type { LayoutNode }

@@ -33,6 +33,10 @@ export function QuakeOverlay(props: { controller: WorkspaceController }) {
           ptyID={overlay().ptyID}
           title="quake terminal"
           focusID="overlay"
+          // The drop-down terminal inherits the session's own selection: the
+          // active env-manager profile, the session's kubeconfigs and its SSH
+          // agent.
+          envBuilder={() => controller.buildEnvForSession(overlay().sessionID)}
           onPtyID={(ptyID) => controller.setOverlayPty(ptyID)}
         />
       </box>

@@ -7,13 +7,16 @@ import {
   equalize,
   findLeaf,
   leafIDs,
+  minimisedLeafIDs,
   normalizeState,
+  pruneMinimised,
   removeLeaf,
   setSplitRatio,
   splitLeaf,
+  swapLeaf,
   validateTree,
 } from "../src/layout.ts"
-import type { LayoutNode, WorkspaceState } from "../src/types.ts"
+import type { LayoutNode, PaneState, WorkspaceState } from "../src/types.ts"
 
 const leaf = (id: string): LayoutNode => ({ type: "leaf", paneID: id })
 
@@ -125,4 +128,63 @@ test("normalizeState repairs missing panes and focus", () => {
   assert.equal(fixed.focused, "a")
   assert.ok(fixed.panes.b)
   assert.equal(fixed.panes.b.kind, "session")
+})
+
+test("swapLeaf exchanges two panes in place", () => {
+  const root = splitLeaf(leaf("a"), "a", "b", "s1", "row")
+  assert.deepEqual(leafIDs(swapLeaf(root, "a", "b")), ["b", "a"])
+  const nested = splitLeaf(root, "b", "c", "s2", "column")
+  assert.deepEqual(leafIDs(swapLeaf(nested, "a", "c")), ["c", "b", "a"])
+})
+
+test("pruneMinimised hides minimised panes and collapses the tree", () => {
+  const root = splitLeaf(leaf("a"), "a", "b", "s1", "row")
+  const nested = splitLeaf(root, "b", "c", "s2", "column")
+  const panes: Record<string, PaneState> = {
+    a: { id: "a", kind: "session" },
+    b: { id: "b", kind: "terminal", tabs: [{ id: "t1" }] },
+    c: { id: "c", kind: "session" },
+  }
+  assert.deepEqual(leafIDs(pruneMinimised(nested, panes)!), ["a", "b", "c"])
+  assert.deepEqual(minimisedLeafIDs(nested, panes), [])
+
+  panes.b.minimised = true
+  // The split that only held b collapses into its sibling.
+  assert.deepEqual(leafIDs(pruneMinimised(nested, panes)!), ["a", "c"])
+  assert.deepEqual(minimisedLeafIDs(nested, panes), ["b"])
+
+  panes.a.minimised = true
+  panes.c.minimised = true
+  assert.equal(pruneMinimised(nested, panes), null)
+})
+
+test("normalizeState migrates a legacy terminal pane into a tab", () => {
+  const state: WorkspaceState = {
+    root: leaf("t1"),
+    panes: { t1: { id: "t1", kind: "terminal", ptyID: "pty-1", title: "logs" } },
+    focused: "t1",
+    counter: 1,
+  }
+  const fixed = normalizeState(state, "t1")
+  const pane = fixed.panes.t1
+  assert.equal(pane.tabs?.length, 1)
+  assert.equal(pane.tabs?.[0]?.ptyID, "pty-1")
+  assert.equal(pane.tabs?.[0]?.title, "logs")
+  assert.equal(pane.activeTab, 0)
+})
+
+test("normalizeState clamps the active tab and keeps focus visible", () => {
+  const state: WorkspaceState = {
+    root: { type: "split", id: "s1", dir: "row", ratio: 0.5, a: leaf("a"), b: leaf("b") },
+    panes: {
+      a: { id: "a", kind: "session", minimised: true },
+      b: { id: "b", kind: "terminal", tabs: [{ id: "t1" }, { id: "t2" }], activeTab: 7 },
+    },
+    focused: "a",
+    counter: 2,
+  }
+  const fixed = normalizeState(state, "b")
+  assert.equal(fixed.panes.b.activeTab, 1)
+  // Pane a is minimised, so focus moves to the only visible pane.
+  assert.equal(fixed.focused, "b")
 })

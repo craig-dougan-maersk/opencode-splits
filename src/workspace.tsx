@@ -1,19 +1,27 @@
 /** @jsxImportSource @opentui/solid */
-import { Show, createEffect } from "solid-js"
+import { For, Show, createEffect } from "solid-js"
 import type { LayoutNode, PaneState, SplitNode } from "./types.ts"
 import type { WorkspaceController } from "./controller.ts"
+import { minimisedLeafIDs, pruneMinimised } from "./layout.ts"
 import { SessionPane } from "./session-pane.tsx"
-import { LayoutTerminalPane } from "./terminal-pane.tsx"
+import { LayoutTerminalPane } from "./terminal-tabs.tsx"
 import { background, textColor } from "./theme.ts"
 
 function paneTitle(controller: WorkspaceController, pane: PaneState): string {
-  if (pane.kind === "terminal") return pane.title || "terminal"
+  if (pane.kind === "terminal") {
+    const tab = controller.activeTab(pane.id)
+    if (tab) return tab.title || tab.kube?.context || tab.profile || "terminal"
+    return "terminal"
+  }
   const session = pane.sessionID ? controller.context.data.session.get(pane.sessionID) : undefined
   return session?.title || (pane.sessionID ? "session" : "new session")
 }
 
 function paneSubtitle(controller: WorkspaceController, pane: PaneState): string {
-  if (pane.kind === "terminal") return "pty"
+  if (pane.kind === "terminal") {
+    const count = controller.terminalTabs(pane.id).length
+    return count > 1 ? `${count} tabs` : "pty"
+  }
   const session = pane.sessionID ? controller.context.data.session.get(pane.sessionID) : undefined
   const directory = session?.location?.directory ?? pane.directory
   if (!directory) return ""
@@ -132,9 +140,38 @@ function Header(props: { controller: WorkspaceController }) {
       </text>
       <box flexGrow={1} />
       <text fg={textColor(context, "muted", "gray")}>
-        ctrl+alt+r split · ctrl+alt+d down · ctrl+alt+x close · ctrl+alt+z zoom · ` quake
+        ctrl+alt+r split · ctrl+alt+t terminal · ctrl+alt+m minimise · /shell
       </text>
     </box>
+  )
+}
+
+/** Panes that are hidden from the layout and can be restored from the dock. */
+function MinimisedDock(props: { controller: WorkspaceController }) {
+  const controller = props.controller
+  const context = controller.context
+  const ids = () => minimisedLeafIDs(controller.state.root, controller.state.panes)
+
+  return (
+    <Show when={ids().length > 0}>
+      <box flexDirection="row" width="100%" height={1} flexShrink={0} paddingLeft={1}>
+        <text fg={textColor(context, "muted", "gray")}>{"docked: "}</text>
+        <For each={ids()}>
+          {(paneID) => (
+            <box
+              onMouseDown={(event: any) => {
+                event?.stopPropagation?.()
+                controller.restorePane(paneID)
+              }}
+            >
+              <text fg={textColor(context, "info", "cyan")}>{`[${paneTitle(controller, controller.state.panes[paneID])}] `}</text>
+            </box>
+          )}
+        </For>
+        <box flexGrow={1} />
+        <text fg={textColor(context, "muted", "gray")}>click to restore</text>
+      </box>
+    </Show>
   )
 }
 
@@ -149,7 +186,7 @@ function Welcome(props: { controller: WorkspaceController }) {
       <text fg={textColor(context, "muted", "gray")}>No panes yet.</text>
       <text fg={textColor(context, "base", "white")}>ctrl+alt+n  new session</text>
       <text fg={textColor(context, "base", "white")}>ctrl+alt+o  open session</text>
-      <text fg={textColor(context, "base", "white")}>ctrl+alt+t  terminal</text>
+      <text fg={textColor(context, "base", "white")}>/shell      terminal wizard</text>
     </box>
   )
 }
@@ -160,20 +197,27 @@ export function Workspace(props: {
 }) {
   const controller = props.controller
   const context = controller.context
+  const visibleRoot = () =>
+    pruneMinimised(controller.state.root, controller.state.panes) ?? controller.state.root
 
-  // Bind the session that launched the workspace to the initial pane, then make
+  // Bind the session that launched the workspace to a session pane, and make
   // sure every session pane has a session (create one lazily if needed).
   createEffect(() => {
     const preferred = props.data?.sessionID
-    const pane = controller.focusedPane()
-    if (!pane) return
-    if (preferred && !pane.sessionID) {
-      void controller.ensureSession(pane.id, preferred)
-      return
+    const panes = Object.values(controller.state.panes) as PaneState[]
+    if (preferred) {
+      const target = panes.find((pane) => pane.kind === "session" && !pane.sessionID)
+      if (target) {
+        void controller.ensureSession(target.id, preferred)
+        return
+      }
     }
-    if (pane.kind === "session" && !pane.sessionID) {
-      void controller.ensureSession(pane.id)
-    }
+    const empty = panes.find((pane) => pane.kind === "session" && !pane.sessionID)
+    if (empty) void controller.ensureSession(empty.id)
+  })
+
+  createEffect(() => {
+    void controller.refreshCatalogue(controller.focusedPane()?.sessionID)
   })
 
   return (
@@ -182,11 +226,12 @@ export function Workspace(props: {
       <Show when={Object.keys(controller.state.panes).length > 0} fallback={<Welcome controller={controller} />}>
         <Show
           when={controller.zoom()}
-          fallback={<PaneNode controller={controller} node={controller.state.root} />}
+          fallback={<PaneNode controller={controller} node={visibleRoot()} />}
         >
           <PaneFrame controller={controller} paneID={controller.state.focused} />
         </Show>
       </Show>
+      <MinimisedDock controller={controller} />
       <box flexDirection="row" width="100%" height={1} flexShrink={0} paddingLeft={1}>
         <text fg={textColor(context, "muted", "gray")}>
           ctrl+alt+←/→ focus · ctrl+alt+shift+←/→ resize · ctrl+alt+e equalize · ctrl+alt+w back
