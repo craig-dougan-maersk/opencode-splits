@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { For, Show, createEffect } from "solid-js"
+import { For, Show, createEffect, createMemo } from "solid-js"
 import type { LayoutNode, PaneState, SplitNode } from "./types.ts"
 import type { WorkspaceController } from "./controller.ts"
 import { minimisedLeafIDs, pruneMinimised } from "./layout.ts"
@@ -32,13 +32,20 @@ function paneSubtitle(controller: WorkspaceController, pane: PaneState): string 
 export function PaneFrame(props: { controller: WorkspaceController; paneID: string }) {
   const controller = props.controller
   const context = controller.context
-  const pane = () => controller.state.panes[props.paneID]
+  const pane = () => (props.paneID ? controller.state.panes[props.paneID] : undefined)
   const focused = () => controller.state.focused === props.paneID
   const active = () => focused() && !controller.overlay().open
   const border = () =>
     focused()
       ? textColor(context, "info", "cyan")
       : textColor(context, "muted", "gray")
+  const title = () => {
+    const current = pane()
+    if (!current) return " "
+    const subtitle = paneSubtitle(controller, current)
+    const kind = current.kind === "terminal" ? "term" : "session"
+    return ` ${kind} · ${paneTitle(controller, current)}${subtitle ? "  " + subtitle : ""} `
+  }
 
   return (
     <Show when={pane()} fallback={<box flexGrow={1} />}>
@@ -50,7 +57,7 @@ export function PaneFrame(props: { controller: WorkspaceController; paneID: stri
         border
         borderStyle="rounded"
         borderColor={border()}
-        title={` ${pane()!.kind === "terminal" ? "term" : "session"} · ${paneTitle(controller, pane()!)}${paneSubtitle(controller, pane()!) ? "  " + paneSubtitle(controller, pane()!) : ""} `}
+        title={title()}
         titleAlignment="left"
         onMouseDown={(event: any) => {
           event?.stopPropagation?.()
@@ -58,7 +65,7 @@ export function PaneFrame(props: { controller: WorkspaceController; paneID: stri
         }}
       >
         <Show
-          when={pane()!.kind === "session"}
+          when={pane()?.kind === "session"}
           fallback={
             <LayoutTerminalPane
               controller={controller}
@@ -99,13 +106,18 @@ function SplitView(props: { controller: WorkspaceController; node: SplitNode }) 
 }
 
 export function PaneNode(props: { controller: WorkspaceController; node: LayoutNode }) {
-  const node = () => props.node
+  const node = createMemo(() => props.node)
   return (
-    <Show
-      when={node().type === "split"}
-      fallback={<PaneFrame controller={props.controller} paneID={(node() as any).paneID} />}
-    >
-      <SplitView controller={props.controller} node={node() as SplitNode} />
+    <Show when={node()} keyed fallback={<box flexGrow={1} />}>
+      {(resolved) =>
+        resolved.type === "split" ? (
+          <SplitView controller={props.controller} node={resolved} />
+        ) : resolved.paneID ? (
+          <PaneFrame controller={props.controller} paneID={resolved.paneID} />
+        ) : (
+          <box flexGrow={1} />
+        )
+      }
     </Show>
   )
 }
@@ -197,8 +209,9 @@ export function Workspace(props: {
 }) {
   const controller = props.controller
   const context = controller.context
-  const visibleRoot = () =>
-    pruneMinimised(controller.state.root, controller.state.panes) ?? controller.state.root
+  const visibleRoot = createMemo(
+    () => pruneMinimised(controller.state.root, controller.state.panes) ?? controller.state.root,
+  )
 
   // Bind the session that launched the workspace to a session pane, and make
   // sure every session pane has a session (create one lazily if needed).
